@@ -64,6 +64,30 @@ class MFOParams:
     # Agentes
     N: Optional[int] = None  # None → se usa |V| automáticamente
 
+    # C1 — Warmup: fase de exploración inicial con θ = 0
+    # Biológico: fase de alta actividad eléctrica espontánea antes del primer
+    # período refractario significativo. 0 = desactivado (comportamiento original).
+    warmup: int = 0  # iters con θ=0 al inicio · sugerido: max(10, n//2)
+
+    # C2 — Inicialización heurística de W
+    # Si se proporciona, reemplaza la inicialización uniforme W0.
+    # Biológico: hifas crecen hacia gradientes de nutrientes, no a ciegas.
+    # Calcular fuera del core: W_inicial[i][j] = W0 / coste[i][j], normalizado.
+    W_inicial: Optional[list[list[float]]] = None
+
+    # C3 — Término heurístico local en la construcción (estilo ACO)
+    # P(i,j) = W[i][j]^alpha_p × eta[i][j]^beta
+    # donde eta[i][j] = 1/coste[i][j] (aristas cortas = mayor atracción local).
+    # beta=0 desactiva C3 y reproduce el comportamiento original exactamente.
+    # Biológico: la hifa responde tanto a la conductancia histórica (W)
+    # como a la concentración local de nutrientes (eta, distancia al objetivo).
+    alpha_p: float = 1.0  # exponente de W en la construcción · 1.0 = mismo que antes
+    beta: float = 0.0  # exponente de eta · 0.0 = desactivado · sugerido: 2.0
+    eta: Optional[list[list[float]]] = None  # matriz 1/coste · None = C3 inactivo
+
+    # alpha_debil: obsoleto, mantenido por compatibilidad, ignorado
+    alpha_debil: float = 0.0
+
     # Reproducibilidad
     seed: Optional[int] = None
 
@@ -89,13 +113,23 @@ class MFOEstado:
     historial: list[dict] = field(default_factory=list)
 
     @classmethod
-    def inicializar(cls, n: int, W0: float) -> "MFOEstado":
+    def inicializar(cls, n: int, W0: float, W_inicial=None) -> "MFOEstado":
         """
         FASE 1 — Inicialización.
-        W homogéneo = micelio en reposo, sin preferencia previa (V_mem = −80 mV).
-        W es simétrico: W[i][j] = W[j][i] siempre.
+
+        Sin W_inicial (original): W homogeneo = micelio en reposo (V_mem = -80 mV).
+        Con W_inicial (C2): usa la matriz precalculada por el llamador.
+            Ejemplo: W_inicial[i][j] = W0 / coste[i][j] sesgado por distancia.
+            Biologico: hifas crecen hacia gradientes de nutrientes existentes.
+
+        W es simetrico en ambos casos: W[i][j] = W[j][i] siempre.
         """
-        W = [[W0 if i != j else 0.0 for j in range(n)] for i in range(n)]
+        if W_inicial is not None:
+            W = [
+                [W_inicial[i][j] if i != j else 0.0 for j in range(n)] for i in range(n)
+            ]
+        else:
+            W = [[W0 if i != j else 0.0 for j in range(n)] for i in range(n)]
         refractario = [0] * n
         return cls(n=n, W=W, refractario=refractario)
 
@@ -126,15 +160,19 @@ class MFOEstado:
 
 def calcular_theta(estado: MFOEstado, params: MFOParams, t: int) -> float:
     """
-    θ(t) = θ_max × (1 − W_medio / W_max)
+    C1 — WARMUP: si t <= params.warmup, theta = 0 (exploracion total).
+    Biologico: fase de alta actividad electrica espontanea inicial del micelio,
+    antes de que el periodo refractario significativo entre en juego.
 
-    W_medio alto (red aprendida) → θ alto → criterio exigente (AND).
-    W_medio bajo (red nueva)     → θ bajo → criterio permisivo (OR).
+    Despues del warmup:
+    theta(t) = theta_max x (1 - W_medio / W_max)
 
-    CORRECCIÓN E1: θ = 0 en t=1 garantiza exploración total en la primera pasada.
-    Biológico: primer potencial de acción espontáneo sin criterio previo.
+    W_medio alto (red aprendida) -> theta alto -> criterio exigente (AND).
+    W_medio bajo (red nueva)     -> theta bajo -> criterio permisivo (OR).
+
+    CORRECCION E1: theta = 0 en t=1 siempre (independiente del warmup).
     """
-    if t == 1:
+    if t <= max(1, params.warmup):
         return 0.0
     wm = estado.W_medio()
     return params.theta_max * (1.0 - wm / params.W_max)
@@ -146,21 +184,36 @@ def calcular_theta(estado: MFOEstado, params: MFOParams, t: int) -> float:
 
 
 def construir_ruta(
-    estado: MFOEstado, nodo_inicio: int, rng: random.Random
+    estado: MFOEstado,
+    nodo_inicio: int,
+    rng: random.Random,
+    params: Optional["MFOParams"] = None,
 ) -> list[int]:
     """
-    El agente construye una ruta guiada por W: P(i,j) ∝ W[i][j].
-    Normalización solo sobre candidatos disponibles (no visitados, no refractarios).
+    El agente construye una ruta guiada por W y opcionalmente por eta (C3).
+
+    Sin C3 (beta=0 o eta=None):
+        P(i,j) proporiconal a W[i][j]
+
+    Con C3 (beta>0 y eta provisto):
+        P(i,j) proporcional a W[i][j]^alpha_p × eta[i][j]^beta
+        donde eta[i][j] = 1/coste[i][j]
+        Biológico: la hifa responde a conductancia histórica (W) y a
+        concentración local de nutrientes (eta).
 
     CORRECCIÓN A3: P normalizada solo sobre candidatos disponibles.
-    CORRECCIÓN A4: si todos bloqueados, modo emergencia → menor W entre no visitados.
-
-    Biológico: la hifa sigue el gradiente de conductancia (tropismo eléctrico).
+    CORRECCIÓN A4: si todos bloqueados, modo emergencia → menor W.
     """
     n = estado.n
     visitados = [False] * n
     ruta = [nodo_inicio]
     visitados[nodo_inicio] = True
+
+    # Parámetros de C3
+    usar_eta = params is not None and params.eta is not None and params.beta > 0
+    alpha_p = params.alpha_p if params is not None else 1.0
+    beta = params.beta if params is not None else 0.0
+    eta = params.eta if usar_eta else None
 
     for _ in range(n - 1):
         i = ruta[-1]
@@ -171,18 +224,30 @@ def construir_ruta(
         ]
 
         if not candidatos:
-            # Modo emergencia: ignorar refractario, elegir menor W disponible.
-            # Biológico: hifa toma la vía de menor resistencia ante obstrucción.
+            # Modo emergencia: ignorar refractario.
+            # Sin eta: elegir menor W. Con eta: elegir mayor W*eta.
             no_visitados = [j for j in range(n) if not visitados[j]]
-            j_elegido = min(no_visitados, key=lambda j: estado.W[i][j])
+            if usar_eta:
+                j_elegido = max(
+                    no_visitados,
+                    key=lambda j: (estado.W[i][j] ** alpha_p) * (eta[i][j] ** beta),
+                )
+            else:
+                j_elegido = min(no_visitados, key=lambda j: estado.W[i][j])
         else:
-            pesos = [estado.W[i][j] for j in candidatos]
-            suma = sum(pesos)
+            if usar_eta:
+                # C3: combinar W^alpha_p con eta^beta
+                pesos = [
+                    (estado.W[i][j] ** alpha_p) * (eta[i][j] ** beta)
+                    for j in candidatos
+                ]
+            else:
+                pesos = [estado.W[i][j] for j in candidatos]
 
+            suma = sum(pesos)
             if suma == 0:
                 j_elegido = rng.choice(candidatos)
             else:
-                # Ruleta sesgada por W
                 r = rng.uniform(0, suma)
                 acumulado = 0.0
                 j_elegido = candidatos[-1]
@@ -217,25 +282,50 @@ def detectar_spikes(
     CORRECCIÓN E2: en t=1, spike automático para el mejor agente.
     Biológico: primer potencial de acción espontáneo (Slayman et al., 1976).
 
-    CORRECCIÓN A5: varios spikes en la misma iteración → todos refuerzan W,
-    pero solo el de mayor mejora actualiza mejor_fitness (gestionado en actualizar_mejor).
+    CORRECCIÓN C3 (si alpha_debil > 0): spike relativo.
+    Si ningún agente supera el mejor histórico, el mejor agente de la iteración
+    dispara un spike débil con mejora proporcional a su ventaja sobre el promedio:
+        mejora_debil = (fitness_medio - fitness_mejor) / fitness_medio * alpha_debil
+    Esto permite que W siga diferenciándose entre iteraciones silenciosas.
+    El spike débil NO actualiza mejor_fitness (manejado en actualizar_mejor).
+    Biológico: P. djamor mantiene actividad eléctrica espontánea basal continua.
+
+    CORRECCIÓN A5: varios spikes → todos refuerzan W, solo el mayor actualiza global.
     """
     N = len(fitnesses)
     spike = [False] * N
     mejora = [0.0] * N
 
+    # t=1: spike automático — primer potencial espontáneo
     if t == 1:
         a_mejor = min(range(N), key=lambda a: fitnesses[a])
         spike[a_mejor] = True
-        mejora[a_mejor] = params.delta  # valor mínimo simbólico
+        mejora[a_mejor] = params.delta
         return spike, mejora
 
+    # Spikes reales: agentes que superan el mejor histórico
+    hay_spike_real = False
     for a in range(N):
         if fitnesses[a] < estado.mejor_fitness:
             m = (estado.mejor_fitness - fitnesses[a]) / estado.mejor_fitness
             mejora[a] = m
             if m >= params.delta and m >= theta:
                 spike[a] = True
+                hay_spike_real = True
+
+    # C3 — Spike débil si no hubo ningún spike real y alpha_debil > 0
+    if not hay_spike_real and params.alpha_debil > 0:
+        a_mejor = min(range(N), key=lambda a: fitnesses[a])
+        f_mejor = fitnesses[a_mejor]
+        f_medio = sum(fitnesses) / N
+        if f_medio > 0 and f_mejor < f_medio:
+            # Mejora relativa del mejor agente sobre el promedio de la iteración
+            m_relativa = (f_medio - f_mejor) / f_medio * params.alpha_debil
+            if m_relativa > 0:
+                spike[a_mejor] = True
+                mejora[a_mejor] = m_relativa
+                # Marcar como spike débil: mejora < delta indica que no actualiza global
+                # (la distinción la hace actualizar_mejor comparando con mejor_fitness)
 
     return spike, mejora
 
@@ -305,8 +395,8 @@ def aplicar_refractario(
     T_ref = MIN( ENTERO(k / mejora[a]),  T_ref_max )
 
     Inversamente proporcional a la mejora:
-      Mejor mejora → T_ref corto  (región prometedora, bloqueo breve)
-      Peor mejora  → T_ref largo  (región marginal, forzar exploración)
+        Mejor mejora → T_ref corto  (región prometedora, bloqueo breve)
+        Peor mejora  → T_ref largo  (región marginal, forzar exploración)
 
     CORRECCIÓN E3: cota T_ref_max evita bloqueo casi permanente.
     CORRECCIÓN A2: bloquea el nodo destino j (no la arista).
@@ -353,9 +443,16 @@ def actualizar_mejor(
             mejor_a = a
 
     if mejor_a >= 0:
-        estado.mejor_solucion = rutas[mejor_a][:]
-        estado.mejor_fitness = fitnesses[mejor_a]
-        estado.sin_mejora = 0
+        # Solo actualizar el mejor global si el fitness realmente mejoró.
+        # Los spikes débiles (C3) refuerzan W pero no actualizan mejor_fitness.
+        if fitnesses[mejor_a] < estado.mejor_fitness:
+            estado.mejor_solucion = rutas[mejor_a][:]
+            estado.mejor_fitness = fitnesses[mejor_a]
+            estado.sin_mejora = 0
+        else:
+            # Spike débil: W se refuerza (en actualizar_pesos) pero el contador
+            # de estancamiento sigue avanzando normalmente.
+            estado.sin_mejora += 1
     else:
         estado.sin_mejora += 1
 
@@ -375,28 +472,28 @@ def mfo(
 
     Parámetros
     ----------
-    n        : número de nodos del grafo del problema
-    evaluar  : función f(ruta) -> float que calcula el coste de una ruta.
-               El algoritmo minimiza este valor.
-               La ruta es una lista de n enteros (0..n-1), sin repetición.
-               El coste debe incluir el cierre del ciclo (ruta[−1] → ruta[0]).
-    params   : instancia de MFOParams con los parámetros del algoritmo.
+    n         : número de nodos del grafo del problema
+    evaluar   : función f(ruta) -> float que calcula el coste de una ruta.
+                El algoritmo minimiza este valor.
+                La ruta es una lista de n enteros (0..n-1), sin repetición.
+                El coste debe incluir el cierre del ciclo (ruta[−1] → ruta[0]).
+    params    : instancia de MFOParams con los parámetros del algoritmo.
 
     Retorna
     -------
     dict con:
-      mejor_solucion : list[int]  — ruta de menor coste encontrada
-      mejor_fitness  : float      — coste de esa ruta
-      iteraciones    : int        — número de iteraciones ejecutadas
-      razon_parada   : str        — cuál de las 3 condiciones terminó
-      historial      : list[dict] — registro por iteración
-      tiempo_seg     : float      — tiempo de ejecución
+        mejor_solucion : list[int]  — ruta de menor coste encontrada
+        mejor_fitness  : float      — coste de esa ruta
+        iteraciones    : int        — número de iteraciones ejecutadas
+        razon_parada   : str        — cuál de las 3 condiciones terminó
+        historial      : list[dict] — registro por iteración
+        tiempo_seg     : float      — tiempo de ejecución
     """
     rng = random.Random(params.seed)
     N = params.N if params.N is not None else n
 
     # ── FASE 1: Inicialización ────────────────────────────────────────────────
-    estado = MFOEstado.inicializar(n, params.W0)
+    estado = MFOEstado.inicializar(n, params.W0, params.W_inicial)
     t_inicio = time.perf_counter()
     razon_parada = "T_max alcanzado"
 
@@ -409,7 +506,7 @@ def mfo(
         theta = calcular_theta(estado, params, t)
 
         # 2B: construir rutas — agente a empieza en nodo (a % n)
-        rutas = [construir_ruta(estado, a % n, rng) for a in range(N)]
+        rutas = [construir_ruta(estado, a % n, rng, params) for a in range(N)]
         fitnesses = [evaluar(r) for r in rutas]
 
         # 2C: detectar spikes (doble umbral δ y θ)

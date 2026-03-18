@@ -135,5 +135,66 @@ class TSPInstance:
 
         return ruta
 
+    def eta_heuristico(self) -> list[list[float]]:
+        """
+        C3 — Calcula la matriz eta[i][j] = 1/coste[i][j].
+
+        eta representa la 'atracción local' de cada arista: aristas cortas
+        tienen mayor eta y atraen más a los agentes en cada paso de construcción.
+
+        Biológico: la hifa responde a la concentración local de nutrientes,
+        que es inversamente proporcional a la distancia.
+
+        Retorna la matriz eta lista para pasar a MFOParams.eta.
+        Los valores de la diagonal son 0.0.
+        """
+        n = self.n
+        eta = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                if i != j and self.coste[i][j] > 0:
+                    eta[i][j] = 1.0 / self.coste[i][j]
+        return eta
+
+    def W_heuristico(self, W0: float, W_max: float = 1.0) -> list[list[float]]:
+        """
+        C2 — Inicializacion heuristica de W proporcional a 1/coste(i,j).
+
+        W[i][j] = W0 / coste[i][j], normalizado para que W_medio = W0
+        y acotado a W_max.
+
+        Biologico: las hifas crecen hacia gradientes de nutrientes conocidos.
+        Aristas cortas (bajo coste) reciben mayor conductancia inicial.
+        Aristas largas (alto coste) reciben menor conductancia inicial.
+
+        Retorna la matriz W lista para pasar a MFOParams.W_inicial.
+        """
+        n = self.n
+        W = [[0.0] * n for _ in range(n)]
+
+        # Paso 1: W[i][j] = W0 / coste[i][j]
+        for i in range(n):
+            for j in range(n):
+                if i != j and self.coste[i][j] > 0:
+                    W[i][j] = W0 / self.coste[i][j]
+
+        # Paso 2: normalizar para que W_medio = W0
+        vals = [W[i][j] for i in range(n) for j in range(n) if i != j]
+        W_medio_actual = sum(vals) / len(vals) if vals else 1.0
+        if W_medio_actual > 0:
+            factor = W0 / W_medio_actual
+            for i in range(n):
+                for j in range(n):
+                    W[i][j] = min(W[i][j] * factor, W_max)
+
+        # Forzar simetria y diagonal 0
+        for i in range(n):
+            W[i][i] = 0.0
+            for j in range(i + 1, n):
+                v = (W[i][j] + W[j][i]) / 2.0
+                W[i][j] = W[j][i] = v
+
+        return W
+
     def __repr__(self) -> str:
         return f"TSPInstance(nombre={self.nombre!r}, n={self.n})"
