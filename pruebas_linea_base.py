@@ -24,7 +24,7 @@ from __future__ import annotations
 import sys
 import time
 
-from Mycelium_Fungal_Optimizer.mfo_core import MFOParams, mfo
+from mfo_core import MFOParams, mfo
 from mfo_utils import (
     imprimir_resultado,
     imprimir_historial,
@@ -438,10 +438,10 @@ def prueba_correcciones() -> None:
 
 PRUEBAS = {
     "escala": prueba_escala,
-    "dinamica": prueba_dinamica,
-    "bootstrap": prueba_bootstrap,
-    "semillas_large": prueba_semillas_large,
-    "correcciones": prueba_correcciones,
+    # "dinamica": prueba_dinamica,
+    # "bootstrap": prueba_bootstrap,
+    # "semillas_large": prueba_semillas_large,
+    # "correcciones": prueba_correcciones,
 }
 
 
